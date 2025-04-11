@@ -1,8 +1,7 @@
 import asyncio
-import time
 from Crypto.Cipher import AES
 from bleak import BleakClient
-import requests
+import aiohttp
 import schedule
 
 # ThingSpeak configuration
@@ -40,24 +39,45 @@ async def get_bm6_data(address):
             bm6_data["soc"] = int(message[12:14], 16)
             bm6_data["temperature"] = int(message[8:10], 16) if message[6:8] != "01" else -int(message[8:10], 16)
 
-    async with BleakClient(address, timeout=30) as client:
-        await client.write_gatt_char("FFF3", encrypt(bytearray.fromhex("d1550700000000000000000000000000")), response=True)
-        await client.start_notify("FFF4", notification_handler)
+    try:
+        async with BleakClient(address, timeout=30) as client:
+            await client.write_gatt_char("FFF3", encrypt(bytearray.fromhex("d1550700000000000000000000000000")), response=True)
+            await client.start_notify("FFF4", notification_handler)
 
-        while not all(bm6_data.values()):
-            await asyncio.sleep(0.1)
+            # Wait for all data to be populated or timeout after a reasonable period
+            for _ in range(50):  # Retry up to ~5 seconds (50 * 0.1s)
+                if all(bm6_data.values()):
+                    break
+                await asyncio.sleep(0.1)
 
-        await client.stop_notify("FFF4")
+            await client.stop_notify("FFF4")
+    except Exception as e:
+        print(f"Error with device {address}: {e}")
+        return None
 
     return bm6_data
 
+async def send_to_thingspeak(payload):
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(THINGSPEAK_URL, params=payload) as response:
+                if response.status == 200:
+                    print("Data sent to ThingSpeak successfully")
+                else:
+                    print(f"Failed to send data to ThingSpeak. Status code: {response.status}")
+        except Exception as e:
+            print(f"Error sending data to ThingSpeak: {str(e)}")
+
 async def collect_and_send_data():
     all_data = []
-    for i, address in enumerate(BM6_ADDRESSES, 1):
+    for i, address in enumerate(BM6_ADDRESSES, start=1):
         try:
             data = await get_bm6_data(address)
-            all_data.append(data)
-            print(f"Module {i} data: {data}")
+            if data:
+                all_data.append(data)
+                print(f"Module {i} data: {data}")
+            else:
+                print(f"Module {i} returned no data.")
         except Exception as e:
             print(f"Error reading Module {i}: {str(e)}")
 
@@ -76,25 +96,18 @@ async def collect_and_send_data():
         # Remove None values from payload
         payload = {k: v for k, v in payload.items() if v is not None}
         
-        try:
-            response = requests.get(THINGSPEAK_URL, params=payload)
-            if response.status_code == 200:
-                print("Data sent to ThingSpeak successfully")
-            else:
-                print(f"Failed to send data to ThingSpeak. Status code: {response.status_code}")
-        except Exception as e:
-            print(f"Error sending data to ThingSpeak: {str(e)}")
+        await send_to_thingspeak(payload)
 
-def run_task():
-    asyncio.run(collect_and_send_data())
-
-def main():
-    schedule.every(15).minutes.do(run_task)
-    
-    print("Service started. Running every 15 minutes.")
+async def run_schedule():
     while True:
         schedule.run_pending()
-        time.sleep(1)
+        await asyncio.sleep(1)
+
+def main():
+    schedule.every(15).minutes.do(lambda: asyncio.create_task(collect_and_send_data()))
+    
+    print("Service started. Running every 15 minutes.")
+    asyncio.run(run_schedule())
 
 if __name__ == "__main__":
     main()
