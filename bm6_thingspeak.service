@@ -3,14 +3,20 @@ Description=BM6 ThingSpeak Data Service
 After=network.target
 
 [Service]
+Type=notify
+NotifyAccess=main
 User=pi
 Group=pi
 WorkingDirectory=/home/pi/
 ExecStart=/home/pi/myenv/bin/python /home/pi/bm6_thingspeak_service.py
+EnvironmentFile=/etc/default/bm6-thingspeak
 Environment="PATH=/home/pi/myenv/bin:/usr/local/bin:/usr/bin:/bin"
 Environment="VIRTUAL_ENV=/home/pi/myenv"
 Restart=always
 RestartSec=10
+WatchdogSec=90
+WatchdogSignal=SIGTERM
+TimeoutStopSec=15
 
 [Install]
 WantedBy=multi-user.target

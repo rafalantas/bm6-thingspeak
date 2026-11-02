@@ -4,6 +4,8 @@ from Crypto.Cipher import AES
 from bleak import BleakClient, BleakScanner
 import aiohttp
 import logging
+import os
+import socket
 
 logging.basicConfig(
     level=logging.INFO,
@@ -11,8 +13,8 @@ logging.basicConfig(
 )
 
 # ThingSpeak configuration
-THINGSPEAK_API_KEY = "NVL7261EIYU8P66S"
-THINGSPEAK_URL = f"https://api.thingspeak.com/update?api_key={THINGSPEAK_API_KEY}"
+THINGSPEAK_API_KEY = os.environ.get("THINGSPEAK_API_KEY")
+THINGSPEAK_URL = "https://api.thingspeak.com/update"
 
 # BM6 module addresses
 BM6_ADDRESSES = [
@@ -30,6 +32,21 @@ BLE_TIMEOUT = 45             # timeout for single BLE connection
 HTTP_TIMEOUT = 20            # timeout for ThingSpeak upload
 SCAN_TIMEOUT = 10            # timeout for BLE scan
 _running_task = None
+
+
+def notify_systemd(message):
+    """Send a readiness or watchdog notification when started by systemd."""
+    address = os.environ.get("NOTIFY_SOCKET")
+    if not address:
+        return
+    if address.startswith("@"):
+        address = "\0" + address[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+            sock.connect(address)
+            sock.sendall(message.encode())
+    except OSError as exc:
+        logging.warning("systemd notification failed: %s", exc)
 
 # -- Encryption ----------------------------------------------------------------
 
@@ -49,8 +66,10 @@ async def is_device_in_range(address):
     Prevents phantom connections in BlueZ when device is out of range."""
     try:
         device = await BleakScanner.find_device_by_address(address, timeout=SCAN_TIMEOUT)
+        notify_systemd("WATCHDOG=1")
         return device is not None
     except Exception as e:
+        notify_systemd("WATCHDOG=1")
         logging.warning(f"Scan error {address}: {e}")
         return False
 
@@ -93,11 +112,14 @@ async def get_bm6_data(address):
 
                 await client.stop_notify("FFF4")
 
+        notify_systemd("WATCHDOG=1")
         return bm6_data
 
     except asyncio.TimeoutError:
+        notify_systemd("WATCHDOG=1")
         logging.warning(f"BLE timeout for {address}")
     except Exception as e:
+        notify_systemd("WATCHDOG=1")
         logging.error(f"BLE error {address}: {e}")
 
     return None
@@ -106,17 +128,28 @@ async def get_bm6_data(address):
 # -- ThingSpeak ----------------------------------------------------------------
 
 async def send_to_thingspeak(payload):
-    """Send data to ThingSpeak via HTTP GET."""
+    """Send data to ThingSpeak and report whether it accepted the update."""
+    if not THINGSPEAK_API_KEY:
+        logging.error("ThingSpeak upload skipped: THINGSPEAK_API_KEY is not configured")
+        return False
+
     try:
         timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(THINGSPEAK_URL, params=payload) as response:
-                if response.status == 200:
-                    logging.info(f"Data sent to ThingSpeak: {payload}")
-                else:
-                    logging.warning(f"ThingSpeak returned status {response.status}")
+            params = {"api_key": THINGSPEAK_API_KEY, **payload}
+            async with session.get(THINGSPEAK_URL, params=params) as response:
+                body = (await response.text()).strip()
+                if response.status == 200 and body.isdigit() and int(body) > 0:
+                    logging.info("ThingSpeak accepted entry %s", body)
+                    return True
+                logging.warning(
+                    "ThingSpeak rejected update (HTTP %s, response %r)",
+                    response.status,
+                    body[:120],
+                )
     except Exception as e:
         logging.error(f"ThingSpeak send error: {e}")
+    return False
 
 
 # -- Main logic ----------------------------------------------------------------
@@ -150,19 +183,32 @@ async def collect_and_send_data():
         await send_to_thingspeak(payload)
 
 
+async def sleep_with_watchdog(duration):
+    """Keep the systemd watchdog alive during the normal 15-minute idle time."""
+    remaining = duration
+    while remaining > 0:
+        interval = min(20, remaining)
+        await asyncio.sleep(interval)
+        remaining -= interval
+        notify_systemd("WATCHDOG=1")
+
+
 async def main():
     logging.info("BM6 -> ThingSpeak service started (interval: 15 min)")
+    notify_systemd("READY=1\nSTATUS=BM6 service ready")
 
     while True:
         try:
-            cycle_timeout = BLE_TIMEOUT * len(BM6_ADDRESSES) + HTTP_TIMEOUT
+            cycle_timeout = (SCAN_TIMEOUT + BLE_TIMEOUT + 1) * len(BM6_ADDRESSES) + HTTP_TIMEOUT + 10
+            notify_systemd("WATCHDOG=1\nSTATUS=Starting BM6 readout")
             await asyncio.wait_for(collect_and_send_data(), timeout=cycle_timeout)
         except asyncio.TimeoutError:
             logging.error("Full cycle exceeded time limit, waiting for next run")
         except Exception as e:
             logging.error(f"Unexpected error in main loop: {e}")
 
-        await asyncio.sleep(INTERVAL_SECONDS)
+        notify_systemd("WATCHDOG=1\nSTATUS=Readout finished; waiting for next interval")
+        await sleep_with_watchdog(INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":
